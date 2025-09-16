@@ -36,21 +36,27 @@ async def _execute_query(engine, params: dict, page_num: int = 1):
         query += " AND state ILIKE :state"
         query_params['state'] = f"%{query_params['state']}%"
 
+    # --- START OF FIX ---
+    # Correctly handle min and max square footage against an array column
     if "min_sqft" in query_params:
-        query += ' AND :min_sqft <= ANY("totalSpaceSqft")'
+        query += ' AND EXISTS (SELECT 1 FROM unnest("totalSpaceSqft") AS s WHERE s >= :min_sqft)'
     if "max_sqft" in query_params:
-        query += ' AND :max_sqft >= ANY("totalSpaceSqft")'
+        query += ' AND EXISTS (SELECT 1 FROM unnest("totalSpaceSqft") AS s WHERE s <= :max_sqft)'
+    # --- END OF FIX ---
+
     if "warehouse_type" in query_params:
         query += ' AND "warehouseType" ILIKE :warehouse_type'
         query_params['warehouse_type'] = f"%{query_params['warehouse_type']}%"
     if "min_rate_per_sqft" in query_params:
-        query += r" AND \"ratePerSqft\" ~ '^[0-9\.]+$' AND CAST(\"ratePerSqft\" AS INTEGER) >= :min_rate_per_sqft"
+        # Corrected regex for rate per sqft
+        query += " AND \"ratePerSqft\" ~ '^[0-9.]+$' AND CAST(\"ratePerSqft\" AS INTEGER) >= :min_rate_per_sqft"
     if "max_rate_per_sqft" in query_params:
-        query += r" AND \"ratePerSqft\" ~ '^[0-9\.]+$' AND CAST(\"ratePerSqft\" AS INTEGER) <= :max_rate_per_sqft"
+        # Corrected regex for rate per sqft
+        query += " AND \"ratePerSqft\" ~ '^[0-9.]+$' AND CAST(\"ratePerSqft\" AS INTEGER) <= :max_rate_per_sqft"
     if "min_docks" in query_params:
-        query += r" AND \"numberOfDocks\" ~ '^[0-9\.]+$' AND CAST(\"numberOfDocks\" AS INTEGER) >= :min_docks"
+        query += " AND \"numberOfDocks\" ~ '^[0-9.]+$' AND CAST(\"numberOfDocks\" AS INTEGER) >= :min_docks"
     if "min_clear_height" in query_params:
-        query += r" AND \"clearHeightFt\" ~ '^[0-9\.]+$' AND CAST(\"clearHeightFt\" AS INTEGER) >= :min_clear_height"
+        query += " AND \"clearHeightFt\" ~ '^[0-9.]+$' AND CAST(\"clearHeightFt\" AS INTEGER) >= :min_clear_height"
     if "compliances" in query_params:
         query += ' AND compliances ILIKE :compliances'
         query_params['compliances'] = f"%{query_params['compliances']}%"
