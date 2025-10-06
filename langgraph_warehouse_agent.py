@@ -123,6 +123,15 @@ async def update_state_node(state: GraphState) -> GraphState:
     print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Parsing user input: '{user_message}'")
     
     if user_message.lower() in ["more", "next", "show more"]:
+        # Add maximum page limit to prevent infinite pagination
+        MAX_PAGES = 10  # Reasonable limit for user experience
+        if state.current_page >= MAX_PAGES:
+            response_message = f"📄 You've reached the maximum number of pages ({MAX_PAGES}). If you'd like to refine your search or try different criteria, just let me know!"
+            state.add_message("assistant", response_message)
+            print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {response_message}")
+            state.next_action = "wait_for_user"
+            return state
+        
         state.current_page += 1
         state.next_action = "search_database"
         return state
@@ -248,6 +257,12 @@ async def confirm_requirements_node(state: GraphState) -> GraphState:
     if state.availability:
         summary_parts.append(f"⏰ Availability: {state.availability}")
     
+    # Add fire NOC and land type requirements to the summary
+    if state.fire_noc_required:
+        summary_parts.append(f"🔥 Fire NOC: Required")
+    if state.land_type_industrial:
+        summary_parts.append(f"🏭 Land Type: Industrial")
+    
     confirmation_message = (
         "Let me confirm your requirements:\n\n" + 
         "\n".join(summary_parts) + 
@@ -298,8 +313,13 @@ async def search_database_node(state: GraphState) -> GraphState:
         
         state.search_results = search_results
         
-        response_message = f"🏢 **Warehouse Search Results (Page {state.current_page})**\n\n{search_results}"
-        if "No warehouses found" not in search_results and "No more warehouses" not in search_results:
+        # Check if no results were found
+        if "NO_RESULTS_FOUND:" in str(search_results) or "No warehouses found" in str(search_results) or "No more warehouses" in str(search_results):
+            response_message = f"🔍 I've checked our listings, but unfortunately we don't have any warehouses that match those exact criteria in our database right now."
+            if state.current_page == 1:  # Only suggest broadening search on first page
+                response_message += " Would you like me to try with different criteria or a broader search?"
+        else:
+            response_message = f"🏢 **Warehouse Search Results (Page {state.current_page})**\n\n{search_results}"
             response_message += "\n\n💡 *Say 'more' or 'next' to see additional options*"
         
         state.add_message("assistant", response_message)

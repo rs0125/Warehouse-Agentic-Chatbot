@@ -33,7 +33,10 @@ async def run_cli_chatbot():
     
     app = create_warehouse_graph()
     
-    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+    config = {
+        "configurable": {"thread_id": str(uuid.uuid4())},
+        "recursion_limit": 50  # Increase from default 25 to 50
+    }
     
     try:
         async for event in app.astream({}, config=config):

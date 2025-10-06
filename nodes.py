@@ -16,6 +16,129 @@ from tools.location_tool import analyze_location_query
 # Initialize LLM
 llm = ChatOpenAI(model="gpt-4o", temperature=0.7) # Slightly increased temp for more creative chat
 
+# ============================ GREETING NODE STARTS HERE ============================
+async def greeting_node(state: GraphState) -> GraphState:
+    """Initial greeting node that welcomes the user and explains what the agent can do."""
+    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Starting with greeting...")
+    
+    greeting_message = (
+        "👋 Welcome to WareOnGo's warehouse discovery platform.\n\n"
+        "I'll help you find suitable warehouse spaces through a quick 3-step process:\n"
+        "1️⃣ Location & Size\n"
+        "2️⃣ Land classification\n"
+        "3️⃣ Additional requirements\n\n"
+        "What location are you considering?"
+    )
+    
+    state.add_message("assistant", greeting_message)
+    print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {greeting_message}")
+    
+    state.workflow_stage = "area_and_size"
+    state.next_action = "wait_for_user"
+    return state
+# ============================ GREETING NODE ENDS HERE ============================
+
+# ============================ STAGE-SPECIFIC NODES START HERE ============================
+async def area_size_gatherer_node(state: GraphState) -> GraphState:
+    """Stage 1: Gather location and size requirements."""
+    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Stage 1: Gathering area and size...")
+    
+    missing_requirements = state.get_missing_requirements()
+    
+    if not missing_requirements:
+        # Both location and size are collected, move to next stage
+        state.advance_workflow_stage()
+        state.next_action = "gather_business_nature"
+        return state
+
+    # Use a PydanticOutputParser to get structured output
+    parser = PydanticOutputParser(pydantic_object=NextQuestion)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a friendly warehouse assistant collecting location and size requirements.
+        
+        In this stage, you need to collect:
+        - Location (city or state)
+        - Size requirements (square footage)
+        
+        Ask ONE question at a time. Be conversational and helpful.
+        Focus on the most important missing requirement first.
+        
+        {format_instructions}"""),
+        ("human", """Here is the conversation history so far:
+        ---
+        {history}
+        ---
+        Missing requirements in this stage: {missing}
+        
+        What should I ask next?""")
+    ])
+    
+    # Format the history for the prompt
+    history = "\n".join([f"{msg['role'].title()}: {msg['content']}" for msg in state.messages])
+    
+    chain = prompt | llm | parser
+    
+    try:
+        next_question_model = await chain.ainvoke({
+            "history": history,
+            "missing": ", ".join(missing_requirements),
+            "format_instructions": parser.get_format_instructions()
+        })
+        question = next_question_model.question
+    except Exception as e:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to generate question: {e}")
+        if "location" in missing_requirements:
+            question = "What city or location are you looking for a warehouse in?"
+        else:
+            question = "How much space do you need? Please specify in square feet."
+
+    state.add_message("assistant", question)
+    print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {question}")
+    
+    state.next_action = "wait_for_user"
+    return state
+
+async def business_nature_gatherer_node(state: GraphState) -> GraphState:
+    """Stage 2: Ask about industrial land CLU requirement."""
+    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Stage 2: Asking about industrial land CLU...")
+    
+    if state.land_type_industrial is not None:
+        # Already have land type preference, move to next stage
+        state.advance_workflow_stage()
+        state.next_action = "gather_specifics"
+        return state
+
+    question = ("What land classification do you require?\n\n"
+               "• **Industrial CLU**: For manufacturing, processing, chemical operations\n"
+               "• **Commercial**: For distribution, storage, retail operations\n\n"
+               "Please specify: industrial or commercial")
+    
+    state.add_message("assistant", question)
+    print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {question}")
+    
+    state.next_action = "wait_for_user"
+    return state
+
+async def specifics_gatherer_node(state: GraphState) -> GraphState:
+    """Stage 3: Gather specific requirements like compliances, budget, etc."""
+    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Stage 3: Gathering specific requirements...")
+    
+    question = ("Additional requirements:\n\n"
+               "• Fire NOC compliance\n"
+               "• Budget range (₹/sqft)\n"
+               "• Structure type (PEB/RCC)\n"
+               "• Loading docks\n"
+               "• Other specifications\n\n"
+               "Please specify your requirements, or type 'none' if not applicable.")
+    
+    state.add_message("assistant", question)
+    print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {question}")
+    
+    state.next_action = "wait_for_user"
+    return state
+# ============================ STAGE-SPECIFIC NODES END HERE ============================
+
 # ============================ NEW NODE STARTS HERE ============================
 async def chit_chat_node(state: GraphState) -> GraphState:
     """Handles conversational filler and generates a natural response."""
@@ -120,122 +243,242 @@ async def requirements_gatherer_node(state: GraphState) -> GraphState:
     return state
 
 async def update_state_node(state: GraphState) -> GraphState:
-    """Node that parses user input and updates the state."""
+    """Node that parses user input and updates the state based on current workflow stage."""
     if not state.messages or state.messages[-1]["role"] != "user":
-        state.next_action = "gather_requirements"
+        # Determine which stage we should go to
+        if state.workflow_stage == "area_and_size":
+            state.next_action = "gather_area_size"
+        elif state.workflow_stage == "land_type_preference":
+            state.next_action = "gather_business_nature"
+        elif state.workflow_stage == "specifics":
+            state.next_action = "gather_specifics"
         return state
     
     user_message = state.messages[-1]["content"]
     user_message_lower = user_message.lower()
-    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Parsing user input: '{user_message}'")
+    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Parsing user input in {state.workflow_stage} stage: '{user_message}'")
     
+    # Handle pagination for search results
     if user_message_lower in ["more", "next", "show more"]:
+        MAX_PAGES = 10
+        if state.current_page >= MAX_PAGES:
+            response_message = f"📄 You've reached the maximum number of pages ({MAX_PAGES}). If you'd like to refine your search or try different criteria, just let me know!"
+            state.add_message("assistant", response_message)
+            print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {response_message}")
+            state.next_action = "wait_for_user"
+            return state
+        
         state.current_page += 1
         state.next_action = "search_database"
         return state
     
-    # ============================ FIX STARTS HERE ============================
-    # This check is now more flexible to catch variations of "yes".
+    # Handle confirmation for search
     affirmative_keywords = ["yes", "yep", "sure", "correct", "confirm", "looks good", "do it", "start"]
     if any(keyword in user_message_lower for keyword in affirmative_keywords):
         state.requirements_confirmed = True
         state.next_action = "search_database"
         return state
-    # ============================= FIX ENDS HERE =============================
 
-    # The prompt and the rest of the function remain the same
+    # Stage-specific parsing
+    if state.workflow_stage == "area_and_size":
+        await _parse_area_size_requirements(state, user_message)
+    elif state.workflow_stage == "land_type_preference":
+        await _parse_business_nature(state, user_message)
+    elif state.workflow_stage == "specifics":
+        await _parse_specific_requirements(state, user_message)
+        
+        # Only in specifics stage, check for location changes
+        location_change_keywords = ["similar warehouses in", "similar in", "show warehouses in", "warehouses in"]
+        if any(keyword in user_message_lower for keyword in location_change_keywords):
+            # This is a location change request, go directly to search
+            state.next_action = "search_database"
+            return state
+    
+    # Handle criteria relaxation requests (when user wants to expand search)
+    if any(keyword in user_message_lower for keyword in ["relax", "expand", "loosen", "more options", "size", "budget", "land type", "fire noc"]):
+        await _handle_criteria_relaxation(state, user_message)
+        # After relaxing criteria, search again
+        state.next_action = "search_database"
+        return state
+    
+    # Check if we can advance to next stage
+    if state.is_ready_for_next_stage():
+        if state.workflow_stage == "area_and_size":
+            state.advance_workflow_stage()
+            state.next_action = "gather_business_nature"
+        elif state.workflow_stage == "land_type_preference":
+            state.advance_workflow_stage()
+            state.next_action = "gather_specifics"
+        elif state.workflow_stage == "specifics":
+            # Ready for confirmation
+            state.next_action = "confirm_requirements"
+    else:
+        # Stay in current stage
+        if state.workflow_stage == "area_and_size":
+            state.next_action = "gather_area_size"
+        elif state.workflow_stage == "land_type_preference":
+            state.next_action = "gather_business_nature"
+        elif state.workflow_stage == "specifics":
+            state.next_action = "gather_specifics"
+    
+    return state
+
+async def _parse_area_size_requirements(state: GraphState, user_message: str):
+    """Parse location and size requirements from user message."""
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are extracting warehouse requirements from user messages. 
-        IMPORTANT: Return ONLY a raw JSON object. Do NOT wrap it in markdown code blocks or add any other text.
-        Return this exact JSON structure:
-        {{"location_query": null, "size_min": null, "size_max": null, "budget_max": null, "warehouse_type": null, "compliances_query": null, "min_docks": null, "min_clear_height": null, "availability": null, "zone": null, "is_broker": null}}
+        ("system", """Extract location and size requirements from user message. 
+        Return ONLY a raw JSON object:
+        {{"location_query": null, "size_min": null, "size_max": null}}
         
         Instructions:
-        1.  If the user specifies a range (e.g., "between 30k and 50k"), populate both `size_min` and `size_max`.
-        2.  For phrases like "up to", "less than", or "maximum of", only populate `size_max` and leave `size_min` as null.
-        3.  For phrases like "at least", "more than", or "minimum of", only populate `size_min` and leave `size_max` as null.
-        4.  If the user wants to remove a filter (e.g., "any size", "remove size filter"), set both `size_min` and `size_max` to null.
-        5.  If the user provides a single target number (e.g., "50000 sqft"), set both `size_min` and `size_max` to that same number.
-        """),
-        ("user", "Extract requirements from this message: {message}")
+        1. For location: extract city/state names
+        2. For size: handle ranges, "up to", "at least", single numbers
+        3. If user says "all warehouses" or "any size", set size fields to null"""),
+        ("user", "Extract requirements: {message}")
     ])
     
     try:
         chain = prompt | llm
         response = await chain.ainvoke({"message": user_message})
+        content = response.content.strip()
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+        json_str = json_match.group(1) if json_match else content
+        parsed_data = json.loads(json_str)
+        
+        # Update location
+        if parsed_data.get("location_query"):
+            state.location_query = parsed_data["location_query"]
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated location: {state.location_query}")
+        
+        # Update size with same logic as before
+        parsed_min_val = parsed_data.get("size_min")
+        parsed_max_val = parsed_data.get("size_max")
+        
+        if parsed_min_val is not None or parsed_max_val is not None:
+            if parsed_min_val and parsed_max_val:
+                size_min, size_max = int(parsed_min_val), int(parsed_max_val)
+                if size_min == size_max:
+                    single_size = size_min
+                    deviation = 0.20
+                    state.size_min, state.size_max = int(single_size * (1 - deviation)), int(single_size * (1 + deviation))
+                    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Created flexible size range: {state.size_min} - {state.size_max} sqft")
+                else:
+                    state.size_min, state.size_max = size_min, size_max
+                    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated size range: {state.size_min} - {state.size_max} sqft")
+            elif parsed_min_val:
+                state.size_min, state.size_max = int(parsed_min_val), None
+                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated minimum size: {state.size_min} sqft")
+            elif parsed_max_val:
+                state.size_min, state.size_max = None, int(parsed_max_val)
+                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated maximum size: {state.size_max} sqft")
+        
+        # Handle "all warehouses" phrases
+        user_message_lower = user_message.lower()
+        all_warehouse_phrases = ["all warehouses", "show all", "any size", "all available"]
+        if any(phrase in user_message_lower for phrase in all_warehouse_phrases):
+            state.size_min, state.size_max = None, None
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Cleared size restrictions")
+            
+    except Exception as e:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to parse area/size: {e}")
+
+async def _parse_business_nature(state: GraphState, user_message: str):
+    """Parse land type preference from user message."""
+    user_message_lower = user_message.lower()
+    
+    # Parse land type preference
+    if any(word in user_message_lower for word in ["industrial", "yes", "manufacturing", "processing"]):
+        state.land_type_industrial = True
+        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Land type: Industrial")
+    elif any(word in user_message_lower for word in ["commercial", "no", "distribution", "storage"]):
+        state.land_type_industrial = False
+        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Land type: Commercial")
+    else:
+        # Default to commercial for flexibility
+        state.land_type_industrial = False
+        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Land type: Commercial (default)")
+
+async def _parse_specific_requirements(state: GraphState, user_message: str):
+    """Parse specific requirements like fire NOC, budget, etc."""
+    user_message_lower = user_message.lower()
+    
+    # Check for new search requests (location changes) - only if we already have a location
+    location_keywords = ["warehouses in", "similar in", "show in", "find in", "search in"]
+    if (state.location_query and  # Only if we already have a location
+        any(keyword in user_message_lower for keyword in location_keywords)):
+        # User wants to search in a different location - parse it
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """Extract location from user message. Return ONLY JSON:
+            {"location_query": null}
+            Extract city/location name after words like 'in', 'warehouses in', etc."""),
+            ("user", "Extract location: {message}")
+        ])
         
         try:
+            chain = prompt | llm
+            response = await chain.ainvoke({"message": user_message})
             content = response.content.strip()
             json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
             json_str = json_match.group(1) if json_match else content
             parsed_data = json.loads(json_str)
             
-            parameter_changed = False
-            
             if parsed_data.get("location_query"):
+                # Reset search parameters for new location
                 state.location_query = parsed_data["location_query"]
                 state.parsed_cities = None
                 state.parsed_state = None
-                parameter_changed = True
-                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated location: {state.location_query}")
-
-            parsed_min_val = parsed_data.get("size_min")
-            parsed_max_val = parsed_data.get("size_max")
-
-            if parsed_min_val is not None or parsed_max_val is not None:
-                parameter_changed = True
-                if parsed_min_val and parsed_max_val:
-                    size_min, size_max = int(parsed_min_val), int(parsed_max_val)
-                    if size_min == size_max:
-                        single_size = size_min
-                        deviation = 0.20
-                        state.size_min, state.size_max = int(single_size * (1 - deviation)), int(single_size * (1 + deviation))
-                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Created flexible size range: {state.size_min} - {state.size_max} sqft")
-                    else:
-                        state.size_min, state.size_max = size_min, size_max
-                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated with explicit size range: {state.size_min} - {state.size_max} sqft")
-                elif parsed_min_val and not parsed_max_val:
-                    state.size_min, state.size_max = int(parsed_min_val), None
-                    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated with minimum size: {state.size_min} sqft")
-                elif not parsed_min_val and parsed_max_val:
-                    state.size_min, state.size_max = None, int(parsed_max_val)
-                    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated with maximum size: {state.size_max} sqft")
-                else:
-                    state.size_min, state.size_max = None, None
-                    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Cleared size requirements.")
-
-            if parsed_data.get("budget_max"):
-                state.budget_max = int(parsed_data["budget_max"])
-                parameter_changed = True
-                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated budget: {state.budget_max}")
-            if parsed_data.get("warehouse_type"):
-                state.warehouse_type = parsed_data["warehouse_type"]
-                parameter_changed = True
-                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated type: {state.warehouse_type}")
-            
-            if parameter_changed:
+                state.current_page = 1
+                state.search_results = None
                 state.requirements_confirmed = False
-                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Search parameters changed, resetting confirmation status.")
-                state.next_action = "gather_requirements"
-            else:
-                state.next_action = "chit_chat"
-
-        except json.JSONDecodeError as je:
-            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to parse JSON from LLM: {je}")
-            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} LLM response was: {response.content}")
-            state.next_action = "chit_chat"
-            
-    except Exception as e:
-        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to parse user input: {e}")
-        state.next_action = "gather_requirements"
+                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} New location search: {state.location_query}")
+                return
+        except Exception as e:
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to parse location: {e}")
     
-    return state
+    # Handle "none" or similar responses
+    if user_message_lower in ["none", "no", "nothing", "no requirements", "that's all"]:
+        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} User indicated no specific requirements")
+        return
+    
+    # Check for budget (ignore vague phrases)
+    vague_budget_phrases = ["as per market", "market rate", "depends", "flexible", "negotiate"]
+    if not any(phrase in user_message_lower for phrase in vague_budget_phrases):
+        # Try to extract specific budget numbers
+        budget_match = re.search(r'₹?(\d+(?:,\d{3})*(?:\.\d+)?)', user_message)
+        if budget_match:
+            try:
+                budget_value = int(budget_match.group(1).replace(',', ''))
+                state.budget_max = budget_value
+                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated budget: ₹{state.budget_max}")
+            except ValueError:
+                pass
+    
+    # Check for fire NOC
+    fire_keywords = ["fire noc", "fire clearance", "fire compliance", "fire certificate"]
+    if any(keyword in user_message_lower for keyword in fire_keywords):
+        state.fire_noc_required = True
+        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Fire NOC required: True")
+    
+    # Check for warehouse type
+    if "peb" in user_message_lower:
+        state.warehouse_type = "PEB"
+        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated warehouse type: PEB")
+    elif "rcc" in user_message_lower:
+        state.warehouse_type = "RCC"
+        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated warehouse type: RCC")
+    
+    # Check for docks
+    dock_match = re.search(r'(\d+)\s*dock', user_message_lower)
+    if dock_match:
+        state.min_docks = int(dock_match.group(1))
+        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated minimum docks: {state.min_docks}")
 
 # (confirm_requirements_node, search_database_node, and human_input_node remain the same as before)
 async def confirm_requirements_node(state: GraphState) -> GraphState:
-    # ... (no changes needed)
+    """Confirm all requirements with the user before searching."""
     print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Confirming requirements...")
     summary_parts = []
+    
     if state.location_query:
         summary_parts.append(f"📍 Location: **{state.location_query}**")
     if state.size_min is not None or state.size_max is not None:
@@ -245,10 +488,18 @@ async def confirm_requirements_node(state: GraphState) -> GraphState:
         summary_parts.append(f"💰 Budget: up to **₹{state.budget_max}/sqft**")
     if state.warehouse_type:
         summary_parts.append(f"🏗️ Type: **{state.warehouse_type}**")
+    
+    # Add fire NOC and land type requirements to the summary
+    if state.fire_noc_required:
+        summary_parts.append(f"🔥 Fire NOC: **Required**")
+    if state.land_type_industrial is not None:
+        land_type_text = "Industrial" if state.land_type_industrial else "Commercial/Flexible"
+        summary_parts.append(f"🏭 Land Type: **{land_type_text}**")
+    
     confirmation_message = (
-        "Alright, let's double-check. Here's what I've got for your search:\n\n" + 
+        "Requirements summary:\n\n" + 
         "\n".join(summary_parts) + 
-        "\n\nDoes this look right to you? If so, I'll start searching right away! (yes/no)"
+        "\n\nProceed with search? (yes/no)"
     )
     state.add_message("assistant", confirmation_message)
     print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {confirmation_message}")
@@ -279,7 +530,8 @@ async def search_database_node(state: GraphState) -> GraphState:
         "max_sqft": state.size_max, "max_rate_per_sqft": state.budget_max, "warehouse_type": state.warehouse_type,
         "compliances": state.compliances_query, "min_docks": state.min_docks,
         "min_clear_height": state.min_clear_height, "availability": state.availability,
-        "zone": state.zone, "is_broker": state.is_broker, "page": state.current_page
+        "zone": state.zone, "is_broker": state.is_broker, "page": state.current_page,
+        "fire_noc_required": state.fire_noc_required, "land_type_industrial": state.land_type_industrial
     }
     search_params = {k: v for k, v in search_params.items() if v is not None}
     try:
@@ -287,11 +539,44 @@ async def search_database_node(state: GraphState) -> GraphState:
         search_results = await find_warehouses_in_db.ainvoke(search_params)
         print(f"{Fore.YELLOW}[TOOL RESULT]{Style.RESET_ALL} Found results")
         state.search_results = search_results
-        if "No warehouses found" in str(search_results) or "No more warehouses" in str(search_results):
-             response_message = f"🔍 On it... Okay, I've checked our listings (Page {state.current_page}), but it looks like we don't have anything that matches those exact criteria right now. Maybe we could try broadening the search a bit?"
+        # Check if no results were found
+        if "NO_RESULTS_FOUND:" in str(search_results) or "No warehouses found" in str(search_results) or "No more warehouses" in str(search_results):
+            if state.current_page == 1:
+                response_message = f"🔍 No warehouses match your criteria. Would you like to modify your search parameters?"
+            else:
+                response_message = f"📄 End of results. {state.current_page-1} pages viewed. Modify search criteria?"
         else:
-            response_message = f"🚀 Okay, I've found some options for you! Here are the results from page {state.current_page}:\n\n{search_results}"
-            response_message += "\n\n💡 If you want to see more, just say **'more'** or **'next'**!"
+            response_message = f"Search results - Page {state.current_page}:\n\n{search_results}"
+            
+            # Count the number of results to determine next actions
+            result_count = search_results.count("ID:")
+            
+            if result_count >= 5:  # Full page, likely more results available
+                response_message += "\n\n💡 Type **'more'** for additional results."
+            elif result_count > 0 and result_count < 5 and state.current_page == 1:
+                # Limited results on first page - offer to relax criteria
+                response_message += f"\n\n🔍 Found {result_count} result{'s' if result_count != 1 else ''}. Would you like to relax any criteria to find more options?\n\n"
+                
+                # Suggest specific relaxations based on current criteria
+                relaxation_options = []
+                if state.size_min and state.size_max:
+                    relaxation_options.append("📦 **Size range** (currently {}-{} sqft)".format(state.size_min, state.size_max))
+                if state.land_type_industrial is not None:
+                    land_type = "Industrial" if state.land_type_industrial else "Commercial"
+                    relaxation_options.append(f"🏭 **Land type** (currently {land_type})")
+                if state.budget_max:
+                    relaxation_options.append(f"💰 **Budget** (currently up to ₹{state.budget_max}/sqft)")
+                if state.fire_noc_required:
+                    relaxation_options.append("🔥 **Fire NOC requirement**")
+                if state.warehouse_type:
+                    relaxation_options.append(f"🏗️ **Warehouse type** (currently {state.warehouse_type})")
+                
+                if relaxation_options:
+                    response_message += "Options to relax:\n" + "\n".join(relaxation_options)
+                    response_message += "\n\nType which criteria to relax (e.g., 'size', 'land type', 'budget') or 'none' to keep current results."
+                else:
+                    response_message += "Type 'search in nearby areas' to expand location, or 'none' to keep current results."
+            # If fewer than 5 results on subsequent pages, don't show "more" (this is the end)
         state.add_message("assistant", response_message)
         print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {response_message}")
     except Exception as e:
@@ -301,15 +586,89 @@ async def search_database_node(state: GraphState) -> GraphState:
     state.next_action = "wait_for_user"
     return state
 
+async def _handle_criteria_relaxation(state: GraphState, user_message: str):
+    """Handle user requests to relax search criteria for more results."""
+    user_message_lower = user_message.lower()
+    
+    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Handling criteria relaxation: {user_message}")
+    
+    # Size relaxation
+    if any(keyword in user_message_lower for keyword in ["size", "sqft", "square feet", "bigger", "smaller"]):
+        if state.size_min and state.size_max:
+            # Expand size range by 30%
+            current_range = state.size_max - state.size_min
+            expansion = int(current_range * 0.3)
+            state.size_min = max(0, state.size_min - expansion)
+            state.size_max = state.size_max + expansion
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Relaxed size range to: {state.size_min} - {state.size_max} sqft")
+        elif state.size_min:
+            # Reduce minimum by 30%
+            state.size_min = int(state.size_min * 0.7)
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Reduced minimum size to: {state.size_min} sqft")
+        elif state.size_max:
+            # Increase maximum by 50%
+            state.size_max = int(state.size_max * 1.5)
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Increased maximum size to: {state.size_max} sqft")
+    
+    # Land type relaxation
+    elif any(keyword in user_message_lower for keyword in ["land type", "land", "industrial", "commercial"]):
+        if state.land_type_industrial is not None:
+            state.land_type_industrial = None  # Accept both industrial and commercial
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Relaxed land type to accept both Industrial and Commercial")
+    
+    # Budget relaxation
+    elif any(keyword in user_message_lower for keyword in ["budget", "price", "rate", "cost", "cheaper", "expensive"]):
+        if state.budget_max:
+            # Increase budget by 20%
+            state.budget_max = int(state.budget_max * 1.2)
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Increased budget to: ₹{state.budget_max}/sqft")
+        else:
+            # If no budget set, don't add one (keep it flexible)
+            pass
+    
+    # Fire NOC relaxation
+    elif any(keyword in user_message_lower for keyword in ["fire noc", "fire", "noc", "compliance"]):
+        if state.fire_noc_required:
+            state.fire_noc_required = False
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Relaxed Fire NOC requirement")
+    
+    # Warehouse type relaxation
+    elif any(keyword in user_message_lower for keyword in ["type", "structure", "peb", "rcc", "shed"]):
+        if state.warehouse_type:
+            state.warehouse_type = None  # Accept all warehouse types
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Relaxed warehouse type to accept all types")
+    
+    # General relaxation - relax the most restrictive criteria
+    elif any(keyword in user_message_lower for keyword in ["all", "everything", "any", "general", "loosen"]):
+        relaxed_something = False
+        
+        # Relax land type first (common restriction)
+        if state.land_type_industrial is not None:
+            state.land_type_industrial = None
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Relaxed land type to accept both")
+            relaxed_something = True
+        
+        # Then relax fire NOC if set
+        elif state.fire_noc_required:
+            state.fire_noc_required = False
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Relaxed Fire NOC requirement")
+            relaxed_something = True
+        
+        # Then expand size range if very specific
+        elif state.size_min and state.size_max and (state.size_max - state.size_min) < 10000:
+            expansion = int((state.size_max - state.size_min) * 0.5)
+            state.size_min = max(0, state.size_min - expansion)
+            state.size_max = state.size_max + expansion
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Expanded size range to: {state.size_min} - {state.size_max} sqft")
+            relaxed_something = True
+        
+        if not relaxed_something:
+            print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} No specific criteria to relax")
+
 async def human_input_node(state: GraphState) -> GraphState:
-    # ... (no changes needed)
-    user_input = input(f"{Fore.CYAN}[YOU]{Style.RESET_ALL} ").strip()
-    if user_input.lower() in ['quit', 'exit', 'bye']:
-        state.conversation_complete = True
-        goodbye_message = "You got it. Thanks for chatting! Feel free to reach out anytime you need to find a warehouse. Have a great day!"
-        state.add_message("assistant", goodbye_message)
-        print(f"{Fore.GREEN}[AGENT]{Style.RESET_ALL} {goodbye_message}")
-        return state
-    state.add_message("user", user_input)
-    state.next_action = "update_state"
+    """Human input node - for API mode, just return state for user to provide input"""
+    # In API mode, we don't wait for CLI input
+    # The API will handle user input separately and invoke the graph again
+    # Just mark that we're waiting for user input and end the workflow
+    state.next_action = "wait_for_user"
     return state
