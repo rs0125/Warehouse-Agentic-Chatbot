@@ -10,6 +10,9 @@ from pydantic.v1 import BaseModel, Field
 class WarehouseSearchInput(BaseModel):
     cities: Optional[List[str]] = Field(description="A list of cities to search for warehouses in, e.g., ['Bangalore', 'Mysore']")
     state: Optional[str] = Field(description="A single state to search for warehouses in, e.g., 'Karnataka'.")
+    search_area: Optional[str] = Field(description="Specific area or locality to search for, e.g., 'Whitefield', 'Electronic City'.")
+    search_address: Optional[str] = Field(description="Address-based search for vector similarity matching.")
+    is_area_search: Optional[bool] = Field(description="Whether this is an area-specific search requiring enhanced filtering.")
     min_sqft: Optional[int] = Field(description="The minimum square footage required.")
     max_sqft: Optional[int] = Field(description="The maximum square footage available.")
     warehouse_type: Optional[str] = Field(description="The type of warehouse, e.g., 'PEB', 'RCC'.")
@@ -29,8 +32,9 @@ class WarehouseSearchInput(BaseModel):
 async def _execute_query(engine, params: dict, page_num: int = 1):
     """A helper function to build and execute the full SQL query asynchronously."""
     # Updated query to join with WarehouseData table for fire NOC and land type info
+    # Include address field for area-based searches
     query = '''SELECT w.id, w."warehouseType", w.city, w.state, w."totalSpaceSqft", w."ratePerSqft", 
-                      w."numberOfDocks", w."clearHeightFt", w.compliances,
+                      w."numberOfDocks", w."clearHeightFt", w.compliances, w.address,
                       wd."fireNocAvailable", wd."fireSafetyMeasures", wd."landType"
                FROM "Warehouse" w
                LEFT JOIN "WarehouseData" wd ON w.id = wd."warehouseId"
@@ -38,7 +42,17 @@ async def _execute_query(engine, params: dict, page_num: int = 1):
     
     query_params = params.copy()
 
-    if "cities" in query_params:
+    # Enhanced location filtering with area support
+    if "search_area" in query_params and "cities" in query_params:
+        # Area-specific search within cities
+        query += " AND (w.city ILIKE ANY(:cities) AND w.address ILIKE :search_area)"
+        query_params['cities'] = [f"%{city}%" for city in query_params['cities']]
+        query_params['search_area'] = f"%{query_params['search_area']}%"
+    elif "search_area" in query_params:
+        # Area-only search
+        query += " AND w.address ILIKE :search_area"
+        query_params['search_area'] = f"%{query_params['search_area']}%"
+    elif "cities" in query_params:
         # Make city search case-insensitive by using ILIKE with ANY
         query += " AND w.city ILIKE ANY(:cities)"
         # Convert all cities to patterns for case-insensitive matching

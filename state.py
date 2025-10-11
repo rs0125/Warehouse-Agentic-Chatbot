@@ -13,6 +13,10 @@ class GraphState:
     location_query: Optional[str] = None
     parsed_cities: Optional[List[str]] = None
     parsed_state: Optional[str] = None
+    search_area: Optional[str] = None
+    search_city: Optional[str] = None
+    search_address: Optional[str] = None
+    is_area_search: Optional[bool] = None
     size_min: Optional[int] = None
     size_max: Optional[int] = None
     budget_min: Optional[int] = None

@@ -860,6 +860,80 @@ async def _parse_legacy_requirements(state: GraphState, user_message: str):
     """Legacy keyword-based parsing for backward compatibility - only when LLM parsing misses things."""
     user_message_lower = user_message.lower()
     
+    # Check for size updates (when explicitly mentioned)
+    size_keywords = ["size", "sqft", "square feet", "area", "space"]
+    if any(keyword in user_message_lower for keyword in size_keywords):
+        # Parse size requirements using LLM for better accuracy
+        try:
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """Extract size requirements from user message. 
+                Return ONLY a raw JSON object:
+                {{"size_min": null, "size_max": null}}
+                
+                Instructions:
+                1. For size: handle ranges, "up to", "at least", single numbers
+                2. If user says "any size", set both fields to null
+                3. Convert all sizes to square feet
+                4. Handle "k" notation: "10k" = 10000"""),
+                ("user", "Extract size: {message}")
+            ])
+            
+            chain = prompt | llm
+            response = await chain.ainvoke({"message": user_message})
+            content = response.content.strip()
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+            json_str = json_match.group(1) if json_match else content
+            parsed_data = json.loads(json_str)
+            
+            parsed_min_val = parsed_data.get("size_min")
+            parsed_max_val = parsed_data.get("size_max")
+            
+            if parsed_min_val is not None or parsed_max_val is not None:
+                if parsed_min_val and parsed_max_val:
+                    # Check if it's actually a single value (min == max)
+                    if parsed_min_val == parsed_max_val:
+                        # Single value - create ±20% range
+                        single_value = int(parsed_min_val)
+                        range_deviation = 0.20  # 20%
+                        state.size_min = int(single_value * (1 - range_deviation))
+                        state.size_max = int(single_value * (1 + range_deviation))
+                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Single value {single_value} sqft converted to range: {state.size_min} - {state.size_max} sqft (±20%)")
+                    else:
+                        # Actual range provided
+                        state.size_min, state.size_max = int(parsed_min_val), int(parsed_max_val)
+                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated size range: {state.size_min} - {state.size_max} sqft")
+                elif parsed_min_val:
+                    # Only minimum provided - could be single value or minimum
+                    single_value = int(parsed_min_val)
+                    # Check if user said "at least" or similar, otherwise treat as single value
+                    if any(phrase in user_message_lower for phrase in ["at least", "minimum", "min", "above", "more than"]):
+                        state.size_min = single_value
+                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated minimum size: {state.size_min} sqft")
+                    else:
+                        # Treat as single value - create ±20% range
+                        range_deviation = 0.20  # 20%
+                        state.size_min = int(single_value * (1 - range_deviation))
+                        state.size_max = int(single_value * (1 + range_deviation))
+                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Single value {single_value} sqft converted to range: {state.size_min} - {state.size_max} sqft (±20%)")
+                elif parsed_max_val:
+                    # Only maximum provided - could be single value or maximum
+                    single_value = int(parsed_max_val)
+                    # Check if user said "up to" or similar, otherwise treat as single value
+                    if any(phrase in user_message_lower for phrase in ["up to", "maximum", "max", "below", "less than", "under"]):
+                        state.size_max = single_value
+                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Updated maximum size: {state.size_max} sqft")
+                    else:
+                        # Treat as single value - create ±20% range
+                        range_deviation = 0.20  # 20%
+                        state.size_min = int(single_value * (1 - range_deviation))
+                        state.size_max = int(single_value * (1 + range_deviation))
+                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Single value {single_value} sqft converted to range: {state.size_min} - {state.size_max} sqft (±20%)")
+            elif "any size" in user_message_lower or "flexible" in user_message_lower:
+                state.size_min, state.size_max = None, None
+                print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Cleared size restrictions")
+        except Exception as e:
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to parse size: {e}")
+    
     # Enhanced Fire NOC parsing (only if not already set by LLM)
     if state.fire_noc_required is None:  # Only if LLM didn't set it
         fire_keywords = ["fire noc", "fire clearance", "fire compliance", "fire certificate", "noc", 
@@ -1029,20 +1103,37 @@ async def search_database_node(state: GraphState) -> GraphState:
     print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Location query: {state.location_query}")
     print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Existing parsed_cities: {state.parsed_cities}")
     print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Existing parsed_state: {state.parsed_state}")
+    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Existing search_area: {state.search_area}")
+    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Existing is_area_search: {state.is_area_search}")
     
-    if state.location_query and not state.parsed_cities and not state.parsed_state:
+    if state.location_query and not state.parsed_cities and not state.parsed_state and not state.search_area:
         try:
             print(f"{Fore.YELLOW}[TOOL]{Style.RESET_ALL} Analyzing location: {state.location_query}")
             location_result = await analyze_location_query.ainvoke({"location_query": state.location_query})
             print(f"{Fore.YELLOW}[TOOL RESULT]{Style.RESET_ALL} {location_result}")
             if isinstance(location_result, dict):
+                # Handle area-specific searches first
+                if location_result.get("search_area") and location_result.get("search_city"):
+                    state.search_area = location_result["search_area"]
+                    state.search_city = location_result["search_city"]
+                    state.is_area_search = True
+                    state.parsed_cities = [location_result["search_city"]]
+                    print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Area search detected - Area: {state.search_area}, City: {state.search_city}")
+                elif location_result.get("is_area_search"):
+                    state.is_area_search = True
+                    if location_result.get("areas"):
+                        state.search_area = location_result["areas"][0]  # Use first area
+                        print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Area indicators detected - Area: {state.search_area}")
+                
+                # Handle standard location results
                 if location_result.get("cities"):
-                    state.parsed_cities = location_result["cities"]
+                    if not state.parsed_cities:  # Don't override if already set by area search
+                        state.parsed_cities = location_result["cities"]
                     print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Parsed cities from tool: {state.parsed_cities}")
                 elif location_result.get("state"):
                     state.parsed_state = location_result["state"]
                     print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Parsed state from tool: {state.parsed_state}")
-                else:
+                elif not state.search_area:  # Only fallback if no area was detected
                     # If tool returns empty result, use original query as city
                     state.parsed_cities = [state.location_query]
                     print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Tool returned empty, using original: {state.parsed_cities}")
@@ -1058,9 +1149,11 @@ async def search_database_node(state: GraphState) -> GraphState:
     else:
         print(f"{Fore.BLUE}[DEBUG]{Style.RESET_ALL} Skipping location tool - using existing parsed data")
     search_params = {
-        "cities": state.parsed_cities, "state": state.parsed_state, "min_sqft": state.size_min,
-        "max_sqft": state.size_max, "min_rate_per_sqft": state.budget_min, "max_rate_per_sqft": state.budget_max, 
-        "warehouse_type": state.warehouse_type, "compliances": state.compliances_query, "min_docks": state.min_docks,
+        "cities": state.parsed_cities, "state": state.parsed_state, "search_area": state.search_area,
+        "search_address": state.search_address, "is_area_search": state.is_area_search,
+        "min_sqft": state.size_min, "max_sqft": state.size_max, "min_rate_per_sqft": state.budget_min, 
+        "max_rate_per_sqft": state.budget_max, "warehouse_type": state.warehouse_type, 
+        "compliances": state.compliances_query, "min_docks": state.min_docks,
         "min_clear_height": state.min_clear_height, "availability": state.availability,
         "zone": state.zone, "is_broker": state.is_broker, "page": state.current_page,
         "fire_noc_required": state.fire_noc_required, "land_type_industrial": state.land_type_industrial
