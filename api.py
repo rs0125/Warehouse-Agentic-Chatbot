@@ -45,7 +45,21 @@ class ConversationContext(BaseModel):
     size_constraint: Optional[str] = None
     size_min: Optional[int] = None  # Add actual size values
     size_max: Optional[int] = None  # Add actual size values
+    budget_min: Optional[float] = None  # Add budget fields
+    budget_max: Optional[float] = None  # Add budget fields
     land_type_preference: Optional[str] = None
+    
+    # Additional queryable fields
+    warehouse_type: Optional[str] = None
+    min_docks: Optional[int] = None
+    min_clear_height: Optional[int] = None
+    compliances_query: Optional[str] = None
+    availability: Optional[str] = None
+    zone: Optional[str] = None
+    is_broker: Optional[bool] = None
+    fire_noc_required: Optional[bool] = None
+    land_type_industrial: Optional[bool] = None
+    
     specific_requirements: List[str] = []
     conversation_history: List[str] = []
 
@@ -94,12 +108,17 @@ def context_to_state(context: Optional[ConversationContext]) -> GraphState:
     
     # Add conversation history as messages
     for msg in context.conversation_history:
-        state.add_message("user", msg)
+        if ": " in msg:
+            role, content = msg.split(": ", 1)
+            state.add_message(role, content)
+        else:
+            # Fallback for old format - assume user message
+            state.add_message("user", msg)
     
     # Map simple fields to state
     if context.area:
         state.location_query = context.area
-        state.parsed_cities = [context.area]
+        # Don't set parsed_cities here - let the location tool expand it during search
     
     # Use actual size values if available, otherwise fall back to size constraint
     if context.size_min is not None or context.size_max is not None:
@@ -115,6 +134,32 @@ def context_to_state(context: Optional[ConversationContext]) -> GraphState:
             state.size_max = 15000
         elif "large" in context.size_constraint.lower():
             state.size_min = 15001
+    
+    # Map budget values
+    if context.budget_min is not None:
+        state.budget_min = context.budget_min
+    if context.budget_max is not None:
+        state.budget_max = context.budget_max
+    
+    # Map additional queryable fields
+    if context.warehouse_type:
+        state.warehouse_type = context.warehouse_type
+    if context.min_docks is not None:
+        state.min_docks = context.min_docks
+    if context.min_clear_height is not None:
+        state.min_clear_height = context.min_clear_height
+    if context.compliances_query:
+        state.compliances_query = context.compliances_query
+    if context.availability:
+        state.availability = context.availability
+    if context.zone:
+        state.zone = context.zone
+    if context.is_broker is not None:
+        state.is_broker = context.is_broker
+    if context.fire_noc_required is not None:
+        state.fire_noc_required = context.fire_noc_required
+    if context.land_type_industrial is not None:
+        state.land_type_industrial = context.land_type_industrial
     
     if context.land_type_preference == "yes":
         state.land_type_industrial = True
@@ -179,11 +224,10 @@ def state_to_context(state) -> ConversationContext:
     if fire_noc_required:
         specific_requirements.append("fire noc required")
     
-    # Extract conversation history (user messages only)
+    # Extract conversation history (ALL messages)
     messages = get_attr(state, 'messages', [])
     conversation_history = [
-        msg["content"] for msg in messages 
-        if msg["role"] == "user"
+        f"{msg['role']}: {msg['content']}" for msg in messages
     ]
     
     # Map stages back
@@ -201,7 +245,21 @@ def state_to_context(state) -> ConversationContext:
         size_constraint=size_constraint,
         size_min=get_attr(state, 'size_min'),
         size_max=get_attr(state, 'size_max'),
+        budget_min=get_attr(state, 'budget_min'),
+        budget_max=get_attr(state, 'budget_max'),
         land_type_preference=land_type_preference,
+        
+        # Include all additional queryable fields
+        warehouse_type=get_attr(state, 'warehouse_type'),
+        min_docks=get_attr(state, 'min_docks'),
+        min_clear_height=get_attr(state, 'min_clear_height'),
+        compliances_query=get_attr(state, 'compliances_query'),
+        availability=get_attr(state, 'availability'),
+        zone=get_attr(state, 'zone'),
+        is_broker=get_attr(state, 'is_broker'),
+        fire_noc_required=get_attr(state, 'fire_noc_required'),
+        land_type_industrial=get_attr(state, 'land_type_industrial'),
+        
         specific_requirements=specific_requirements,
         conversation_history=conversation_history
     )

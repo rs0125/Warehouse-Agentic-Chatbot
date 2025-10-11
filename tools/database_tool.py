@@ -39,10 +39,13 @@ async def _execute_query(engine, params: dict, page_num: int = 1):
     query_params = params.copy()
 
     if "cities" in query_params:
-        query += " AND w.city = ANY(:cities)"
+        # Make city search case-insensitive by using ILIKE with ANY
+        query += " AND w.city ILIKE ANY(:cities)"
+        # Convert all cities to patterns for case-insensitive matching
+        query_params['cities'] = [f"%{city}%" for city in query_params['cities']]
     elif "state" in query_params:
         query += " AND w.state ILIKE :state"
-        query_params['state'] = f"%{query_params['state']}%"
+        query_params['state'] = query_params['state']  # Exact match for state names
 
     # Handle min and max square footage against an array column
     if "min_sqft" in query_params:
@@ -151,7 +154,10 @@ async def find_warehouses_in_db(**kwargs) -> str:
                             rows.append(row)
 
         if not rows:
-            return "NO_RESULTS_FOUND: No more warehouses found matching the criteria." if page > 1 else "NO_RESULTS_FOUND: No warehouses found matching those criteria."
+            if page > 1:
+                return "NO_RESULTS_FOUND: That's all the warehouses I could find with your current criteria. Try adjusting your location, budget, or size requirements for more options."
+            else:
+                return "NO_RESULTS_FOUND: No warehouses found with these exact requirements. Consider expanding your search area, adjusting budget range, or relaxing size specifications to see more options."
 
         formatted_results = []
         for row in rows:
@@ -215,8 +221,16 @@ async def find_warehouses_in_db(**kwargs) -> str:
             param_values = []
             
             if "cities" in params:
-                query += " AND w.city = ANY($" + str(len(param_values) + 1) + ")"
-                param_values.append(params["cities"])
+                # Use case-insensitive search for cities in asyncpg fallback
+                city_conditions = []
+                for city in params["cities"]:
+                    city_conditions.append(f"w.city ILIKE $" + str(len(param_values) + 1))
+                    param_values.append(f"%{city}%")
+                query += " AND (" + " OR ".join(city_conditions) + ")"
+            elif "state" in params:
+                # Add missing state filtering for asyncpg fallback
+                query += " AND w.state ILIKE $" + str(len(param_values) + 1)
+                param_values.append(params['state'])  # Exact match for state names
             
             if "min_sqft" in params:
                 query += ' AND EXISTS (SELECT 1 FROM unnest(w."totalSpaceSqft") AS s WHERE s >= $' + str(len(param_values) + 1) + ')'
@@ -244,7 +258,7 @@ async def find_warehouses_in_db(**kwargs) -> str:
             await conn.close()
             
             if not rows:
-                return "NO_RESULTS_FOUND: No warehouses found matching those criteria."
+                return "NO_RESULTS_FOUND: No warehouses found with these specifications. Try expanding your location radius, increasing budget range, or adjusting size requirements to see more available options."
             
             formatted_results = []
             for row in rows:

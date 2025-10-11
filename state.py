@@ -15,6 +15,7 @@ class GraphState:
     parsed_state: Optional[str] = None
     size_min: Optional[int] = None
     size_max: Optional[int] = None
+    budget_min: Optional[int] = None
     budget_max: Optional[int] = None
     warehouse_type: Optional[str] = None
     compliances_query: Optional[str] = None
